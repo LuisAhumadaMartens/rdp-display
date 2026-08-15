@@ -8,8 +8,8 @@ the other in the same commit; they must never disagree.
 
 ## Making changes
 
-**Never commit directly to `main` or `dev`.** Work on a branch and open a pull
-request against **`dev`**.
+**Never commit directly to `main`.** Work on a branch and open a pull request
+against **`main`**.
 
 Every PR description must state **what changed and why**. The *why* matters more
 than usual here: this project exists to work around undocumented platform
