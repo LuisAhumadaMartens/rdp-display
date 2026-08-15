@@ -59,6 +59,7 @@ negotiates itself onto 3390.
 
 - GNOME 46+ on **X11** (the confirmation keystroke uses `xdotool`)
 - `gnome-remote-desktop` with **Desktop Sharing** enabled
+- Python 3.11+ (for `tomllib`)
 - `xdotool`, `python3-gi`, `iproute2`
 
 ```sh
@@ -73,15 +74,20 @@ cd rdp-display
 ./install.sh
 ```
 
-Then edit the profiles (see below) and start it:
+`install.sh` creates `~/.config/rdp-display/config.toml` from the example on
+first run, and never overwrites it afterwards. Edit it, then start the watcher:
 
 ```sh
 systemctl --user enable --now rdp-display
 ```
 
-## Configuring profiles
+## Configuration
 
-Mode IDs are specific to your monitor. List them:
+All settings live in `~/.config/rdp-display/config.toml` (override the path with
+`RDP_DISPLAY_CONFIG`). Nothing needs editing inside the script, so upgrades don't
+clobber your setup.
+
+Mode IDs are specific to your monitor. List them — this works without a config:
 
 ```sh
 rdp-display modes
@@ -93,22 +99,35 @@ DP-0  (AUS PG32UCDM)
    2560x1440@120.000   scales=[1.0, 1.25, 1.495, 2.0, ...]
 ```
 
-Then edit the `PROFILES` block at the top of `rdp-display`:
+Then write them into the config:
 
-```python
-PROFILES = {
-    "local":        {"mode": "3840x2160@119.999", "scale": 1.5},
-    "remote":       {"mode": "1920x1080@119.879", "scale": 1.0},
-    "remote-1440":  {"mode": "2560x1440@120.000", "scale": 1.0},
-    "remote-hidpi": {"mode": "2560x1440@120.000", "scale": 2.0},
-}
+```toml
+connector = ""
 
-REMOTE_PROFILE = "remote-hidpi"
-LOCAL_PROFILE = "local"
+remote_profile = "remote-hidpi"
+local_profile = "local"
+
+[profiles.local]
+mode = "3840x2160@119.999"
+scale = 1.5
+
+[profiles.remote-hidpi]
+mode = "2560x1440@120.000"
+scale = 2.0
 ```
 
-The scale must appear in that mode's `scales=` list. Prefer integers — see the
-NVENC note above.
+`connector = ""` auto-detects the primary monitor. The scale must appear in that
+mode's `scales=` list.
+
+Only the **remote** profile has to use an integer scale — it's the one being
+encoded. The local profile is whatever you like at your desk; a fractional scale
+there costs nothing because nothing is streaming it.
+
+Check it parsed before starting the service:
+
+```sh
+rdp-display config
+```
 
 **Picking a remote profile.** What matters is how far your client has to shrink
 the image. Match the session width to your client window's width and both the
@@ -121,6 +140,7 @@ cost of workspace. `remote-1440` gives the most workspace. `remote` sits between
 ```sh
 rdp-display status          # current mode, scale, profile, live session count
 rdp-display modes           # every mode this monitor offers, and its scales
+rdp-display config          # the loaded configuration and where it came from
 rdp-display apply <name>    # force a profile by hand
 rdp-display watch           # the watcher (what the systemd unit runs)
 ```
@@ -132,14 +152,16 @@ systemctl --user stop rdp-display      # kill switch
 
 ## Tuning
 
-| Setting | Default | Notes |
+| Key | Default | Notes |
 |---|---|---|
-| `POLL_SECONDS` | `0.5` | Fast enough to resize before RDPGFX negotiates |
-| `CONNECT_TICKS` | `2` | ~1s. Raising this loses the race and forces a bounce |
-| `DISCONNECT_TICKS` | `30` | ~15s. Deliberately slow so reconnects don't flap the monitor |
-| `BOUNCE_AFTER_RESIZE` | `False` | Set `True` if video freezes on connect |
-| `CONFIRM_DELAY_SECONDS` | `2` | How long to wait for the dialog before pressing Keep |
-| `MAX_ASSERTS` | `3` | Give up after this many failed applies in `ASSERT_WINDOW_SECONDS` |
+| `poll_seconds` | `0.5` | Fast enough to resize before RDPGFX negotiates |
+| `connect_ticks` | `2` | ~1s. Raising this loses the race and forces a bounce |
+| `disconnect_ticks` | `30` | ~15s. Deliberately slow so reconnects don't flap the monitor |
+| `bounce_after_resize` | `false` | Set `true` if video freezes on connect |
+| `confirm_delay_seconds` | `2.0` | How long to wait for the dialog before pressing Keep |
+| `reconnect_grace_seconds` | `60` | Ignore the session gap caused by a deliberate bounce |
+| `max_asserts` | `3` | Give up after this many applies within `assert_window_seconds` |
+| `assert_window_seconds` | `900` | Window the giveup budget is counted over |
 
 ## Troubleshooting
 

@@ -53,6 +53,27 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
 Both trailers go at the end of the message, after a blank line.
 
+## Code style
+
+**No comments in source files.** Not inline comments, not explanatory block
+comments. Let the names carry the meaning — if a line needs explaining, rename
+things or extract a function until it doesn't.
+
+The only prose kept in the source is the module docstring in `rdp-display`,
+because it's printed as the command's help text. It is functional output, not
+commentary.
+
+Everything a reader would otherwise learn from a comment goes in `README.md`
+(user-facing) or this file (contributor-facing). That makes the section below
+load-bearing rather than a nicety: with no comments in the code, it is the only
+record of why several non-obvious pieces exist. **Keep it updated when you change
+them.**
+
+**Configuration does not belong in the source.** All tunables live in
+`~/.config/rdp-display/config.toml`, with defaults in `DEFAULTS` and a shipped
+`config.example.toml`. Adding a new setting means updating all three plus the
+README tuning table. Never reintroduce a constant that a user would want to edit.
+
 ## Testing a change
 
 Display changes affect the live session, so they can't be tested in isolation:
@@ -75,16 +96,18 @@ working. If that happens while testing, reconnect; it isn't a hang.
 Each of these was added to fix a specific, reproducible failure. Don't simplify
 any of them away without reading the README section that explains it:
 
-- **Integer scales only in `PROFILES`.** Fractional scaling inflates the
+- **An integer scale on the remote profile.** Fractional scaling inflates the
   framebuffer past the GPU encoder's limit and silently drops to CPU encoding.
+  This only constrains the profile being encoded; the local profile is free.
 - **The synthetic `Return` after applying.** gnome-shell's confirmation dialog
   rolls back even a persistent apply, which turns an automated switch into an
   infinite apply/revert loop.
-- **The windowed apply counter (`MAX_ASSERTS`).** A consecutive-failure counter
-  does not work: a reverted config reads back correct during the dialog's
-  countdown, so the counter resets every cycle and never trips.
+- **The windowed apply counter (`max_asserts` over `assert_window_seconds`).** A
+  consecutive-failure counter does not work: a reverted config reads back correct
+  during the dialog's countdown, so the counter resets every cycle and never
+  trips.
 - **Session detection by process name, not port.** GRD negotiates its own port
   and will move off 3389 if anything else holds it.
-- **`POLL_SECONDS = 0.5` with `CONNECT_TICKS = 2`.** The resize has to land
+- **`poll_seconds = 0.5` with `connect_ticks = 2`.** The resize has to land
   before GRD negotiates its graphics pipeline, roughly one second after the TCP
   connection. Polling slower means every connect needs a reconnect.

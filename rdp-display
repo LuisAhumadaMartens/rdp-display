@@ -1,88 +1,108 @@
 #!/usr/bin/env python3
-"""Follow gnome-remote-desktop session state and force the display profile.
+"""Automatic display profiles for GNOME Remote Desktop.
 
-A remote session gets a resolution close to the MacBook's own, so the client
-isn't shrinking a 5120px-wide image down to fit -- that shrink is what made the
-desktop tiny while leaving the pointer bitmap full size. No session means
-nobody is connected, whether that was a clean disconnect, a dropped link, or a
-reboot, so the monitor goes back to native 4K.
-
-Changes are forced, never offered. ApplyMonitorsConfig method 2 applies
-persistently with no confirmation dialog and no rollback (verified: a config
-held for 35s, well past mutter's ~20s revert window). Persistence also means a
-power cut while away brings the machine back on the remote profile by itself.
-
-    rdp-display modes           every mode this monitor offers, and its scales
-    rdp-display status          current mode/scale, live session count
-    rdp-display apply <name>    force a profile by hand
-    rdp-display watch           run the watcher (used by the systemd unit)
+    rdp-display modes            list every mode and the scales mutter accepts
+    rdp-display status           current mode, scale, profile, session count
+    rdp-display config           show the loaded configuration and its source
+    rdp-display apply <profile>  force a profile
+    rdp-display watch            run the watcher
 """
 
+import os
 import shutil
 import subprocess
 import sys
 import time
+import tomllib
 
-import gi
 from gi.repository import Gio, GLib
 
-# A connector name like "DP-0" or "HDMI-1", or None to use the primary monitor.
-# Run `rdp-display modes` to see what this machine offers.
-CONNECTOR = None
-
-# Scale must stay integer. Any fractional scale makes mutter render into an
-# oversized framebuffer (1.5 -> 5120x2880), which blows past Pascal's 4096px
-# NVENC limit and silently forces CPU encoding.
-PROFILES = {
-    "local": {"mode": "3840x2160@119.999", "scale": 1.5},
-    "remote": {"mode": "1920x1080@119.879", "scale": 1.0},
-    "remote-1440": {"mode": "2560x1440@120.000", "scale": 1.0},
-    # 2x is integer, so the framebuffer stays 2560x1440 rather than inflating.
-    # Streams a 1280x720 logical desktop at 1440p: Retina-like, large and sharp,
-    # at the cost of workspace.
-    "remote-hidpi": {"mode": "2560x1440@120.000", "scale": 2.0},
-}
-
-REMOTE_PROFILE = "remote-hidpi"  # see PROFILES for the other candidates
-LOCAL_PROFILE = "local"
-
-POLL_SECONDS = 0.5
-# Asymmetric on purpose: reconnects are routine, and flapping the monitor on
-# every brief drop is worse than reacting to a real disconnect a few seconds late.
-# Connect is deliberately near-instant: GRD negotiates its graphics pipeline a
-# second or two after the TCP connection, and resizing before that happens means
-# there is nothing stale to renegotiate and no bounce is needed.
-CONNECT_TICKS = 2        # ~1s
-DISCONNECT_TICKS = 30    # ~15s
-
-# Bouncing the daemon guarantees a correctly-sized session but costs the user a
-# manual reconnect. Left off to try winning the race above; set True if video
-# freezes on connect (picture stuck, keyboard still working).
-BOUNCE_AFTER_RESIZE = False
-# After we deliberately bounce the daemon, the session count is 0 for a moment.
-# Ignore that gap so it doesn't read as "user went away".
-RECONNECT_GRACE_SECONDS = 60
-# If a profile refuses to stick -- something else is overriding us, or the
-# keep/revert OSD is rolling it back -- stop re-asserting. Self-healing plus an
-# external override would otherwise flap the monitor every DISCONNECT_TICKS
-# forever. Give up until the session state changes on its own.
-MAX_ASSERTS = 3
-# Counted over a window, not consecutively. A reverted config reads back correct
-# for the OSD's ~20s countdown before rolling back, so a consecutive-failure
-# counter resets every cycle and never trips.
-ASSERT_WINDOW_SECONDS = 900
-# How long to let the confirmation dialog appear before answering it.
-CONFIRM_DELAY_SECONDS = 2
-
+DEST = "org.gnome.Mutter.DisplayConfig"
+OBJECT_PATH = "/org/gnome/Mutter/DisplayConfig"
 GET_STATE_SIG = "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"
 APPLY_SIG = "(uua(iiduba(ssa{sv}))a{sv})"
+APPLY_METHOD_PERSISTENT = 2
+SCALE_TOLERANCE = 0.01
 
-DEST = "org.gnome.Mutter.DisplayConfig"
-PATH = "/org/gnome/Mutter/DisplayConfig"
+DEFAULTS = {
+    "connector": "",
+    "remote_profile": "remote",
+    "local_profile": "local",
+    "bounce_after_resize": False,
+    "poll_seconds": 0.5,
+    "connect_ticks": 2,
+    "disconnect_ticks": 30,
+    "confirm_delay_seconds": 2.0,
+    "reconnect_grace_seconds": 60,
+    "max_asserts": 3,
+    "assert_window_seconds": 900,
+}
+
+config = dict(DEFAULTS, profiles={})
+config_source = "(defaults)"
+connector = ""
 
 
-def log(msg):
-    print(msg, flush=True)
+def log(message):
+    print(message, flush=True)
+
+
+def fail(message):
+    raise SystemExit("rdp-display: %s" % message)
+
+
+def config_path():
+    override = os.environ.get("RDP_DISPLAY_CONFIG")
+    if override:
+        return override
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "rdp-display", "config.toml")
+
+
+def load_config():
+    global config, config_source
+    path = config_path()
+    if not os.path.exists(path):
+        fail("no configuration at %s\n"
+             "         copy config.example.toml there and edit it" % path)
+    try:
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as exc:
+        fail("%s is not valid TOML: %s" % (path, exc))
+
+    loaded = dict(DEFAULTS)
+    for key, value in data.items():
+        if key != "profiles":
+            loaded[key] = value
+    loaded["profiles"] = data.get("profiles", {})
+
+    config = loaded
+    config_source = path
+    validate_config()
+
+
+def validate_config():
+    profiles = config["profiles"]
+    if not profiles:
+        fail("%s defines no [profiles]" % config_source)
+
+    for key in ("remote_profile", "local_profile"):
+        name = config[key]
+        if name not in profiles:
+            fail("%s = %r in %s, but no such profile is defined (have: %s)"
+                 % (key, name, config_source, ", ".join(sorted(profiles))))
+
+    for name, profile in profiles.items():
+        missing = [k for k in ("mode", "scale") if k not in profile]
+        if missing:
+            fail("profile %r in %s is missing: %s"
+                 % (name, config_source, ", ".join(missing)))
+    remote = profiles[config["remote_profile"]]
+    if float(remote["scale"]) % 1 != 0:
+        log("warning: remote profile %r uses fractional scale %s, which inflates "
+            "the framebuffer and can exceed the GPU encoder limit"
+            % (config["remote_profile"], remote["scale"]))
 
 
 def connect_bus():
@@ -90,187 +110,168 @@ def connect_bus():
 
 
 def get_state(bus):
-    res = bus.call_sync(DEST, PATH, DEST, "GetCurrentState", None,
-                        GLib.VariantType(GET_STATE_SIG),
-                        Gio.DBusCallFlags.NONE, -1, None)
-    return res.unpack()
+    result = bus.call_sync(DEST, OBJECT_PATH, DEST, "GetCurrentState", None,
+                           GLib.VariantType(GET_STATE_SIG),
+                           Gio.DBusCallFlags.NONE, -1, None)
+    return result.unpack()
 
 
-def ensure_connector(bus):
-    """Resolve CONNECTOR to the primary monitor when it was left unset."""
-    global CONNECTOR
-    if CONNECTOR:
-        return CONNECTOR
+def resolve_connector(bus):
+    global connector
+    if connector:
+        return connector
+    if config["connector"]:
+        connector = config["connector"]
+        return connector
     _serial, monitors, logical, _props = get_state(bus)
-    for _x, _y, _sc, _tr, primary, mons, _lp in logical:
-        if primary and mons:
-            CONNECTOR = mons[0][0]
-            return CONNECTOR
+    for _x, _y, _scale, _transform, primary, monitor_specs, _props2 in logical:
+        if primary and monitor_specs:
+            connector = monitor_specs[0][0]
+            return connector
     if monitors:
-        CONNECTOR = monitors[0][0][0]
-        return CONNECTOR
-    raise RuntimeError("no monitors reported by mutter")
+        connector = monitors[0][0][0]
+        return connector
+    fail("mutter reports no monitors")
 
 
 def list_modes(bus):
-    """Print every mode and the scales mutter will accept for it."""
     _serial, monitors, _logical, _props = get_state(bus)
-    for spec, modes, _mprops in monitors:
+    for spec, modes, _props2 in monitors:
         print("%s  (%s %s)" % (spec[0], spec[1], spec[2]))
-        for mid, _w, _h, _refresh, _pref, scales, mp in modes:
-            marks = " ".join(sorted(k for k in mp))
+        for mode_id, _w, _h, _refresh, _preferred, scales, flags in modes:
             print("   %-24s scales=%s %s"
-                  % (mid, [round(s, 3) for s in scales], marks))
+                  % (mode_id, [round(s, 3) for s in scales],
+                     " ".join(sorted(flags))))
 
 
 def read_current(bus):
-    """Return (serial, current_mode_id, current_scale) for CONNECTOR."""
     serial, monitors, logical, _props = get_state(bus)
 
     mode = None
-    for spec, modes, _mprops in monitors:
-        if spec[0] != CONNECTOR:
+    for spec, modes, _props2 in monitors:
+        if spec[0] != connector:
             continue
-        for mid, _w, _h, _refresh, _pref, _scales, mp in modes:
-            if mp.get("is-current"):
-                mode = mid
+        for mode_id, _w, _h, _refresh, _preferred, _scales, flags in modes:
+            if flags.get("is-current"):
+                mode = mode_id
 
     scale = None
-    for _x, _y, sc, _transform, _primary, mons, _lp in logical:
-        if any(m[0] == CONNECTOR for m in mons):
-            scale = sc
+    for _x, _y, current_scale, _transform, _primary, specs, _props2 in logical:
+        if any(spec[0] == connector for spec in specs):
+            scale = current_scale
 
     return serial, mode, scale
 
 
-def current_profile(bus):
-    """Which profile is live right now, or None if it matches nothing.
+def matches(profile, mode, scale):
+    return (mode == profile["mode"]
+            and scale is not None
+            and abs(scale - float(profile["scale"])) < SCALE_TOLERANCE)
 
-    Deriving this from the hardware each tick rather than remembering what we
-    last applied makes the watcher self-healing: anything that changes the
-    display behind our back gets corrected on the next pass.
-    """
+
+def current_profile(bus):
     _serial, mode, scale = read_current(bus)
     if scale is None:
         return None
-    for name, profile in PROFILES.items():
-        if mode == profile["mode"] and abs(scale - profile["scale"]) < 0.01:
+    for name, profile in config["profiles"].items():
+        if matches(profile, mode, scale):
             return name
     return None
 
 
 def apply_profile(bus, name):
-    """Force a profile. Returns True if the config actually changed."""
-    profile = PROFILES[name]
+    profile = config["profiles"][name]
     serial, mode, scale = read_current(bus)
-
-    if mode == profile["mode"] and scale is not None and abs(scale - profile["scale"]) < 0.01:
+    if matches(profile, mode, scale):
         return False
 
-    logical = [(0, 0, profile["scale"], 0, True, [(CONNECTOR, profile["mode"], {})])]
-    args = GLib.Variant(APPLY_SIG, (serial, 2, logical, {}))
-    bus.call_sync(DEST, PATH, DEST, "ApplyMonitorsConfig", args, None,
+    logical = [(0, 0, float(profile["scale"]), 0, True,
+                [(connector, profile["mode"], {})])]
+    args = GLib.Variant(APPLY_SIG,
+                        (serial, APPLY_METHOD_PERSISTENT, logical, {}))
+    bus.call_sync(DEST, OBJECT_PATH, DEST, "ApplyMonitorsConfig", args, None,
                   Gio.DBusCallFlags.NONE, -1, None)
     return True
 
 
 def rdp_sessions():
-    """Count established connections owned by the GRD daemon.
-
-    Matching the process rather than a port survives the port negotiation that
-    already moved this daemon from 3389 to 3390 once. Returns None when the
-    count can't be read, so the caller holds state instead of guessing.
-    """
     try:
-        out = subprocess.run(["ss", "-Htnp", "state", "established"],
-                             capture_output=True, text=True, timeout=5).stdout
+        completed = subprocess.run(["ss", "-Htnp", "state", "established"],
+                                   capture_output=True, text=True, timeout=5)
     except Exception:
         return None
-    return sum(1 for line in out.splitlines() if "gnome-remote-de" in line)
+    return sum(1 for line in completed.stdout.splitlines()
+               if "gnome-remote-de" in line)
 
 
 def confirm_display_change():
-    """Answer gnome-shell's "Keep Changes / Revert Settings" dialog.
-
-    Despite ApplyMonitorsConfig being told to apply persistently, gnome-shell
-    still puts up the confirmation OSD, and its timeout genuinely rolls the
-    config back -- an unattended switch would otherwise apply, revert, and
-    reapply forever. The dialog declares "Keep Changes" as its default action
-    (Escape is bound to "Revert Settings"), so a synthetic Return keeps it.
-
-    Only ever called immediately after we changed the config ourselves, so the
-    keystroke lands in a window where the dialog is the expected recipient.
-    """
     if not shutil.which("xdotool"):
-        log("xdotool missing: cannot confirm, config will revert in ~20s")
+        log("xdotool not found; the display change will revert in ~20s")
         return False
-    time.sleep(CONFIRM_DELAY_SECONDS)
+    time.sleep(config["confirm_delay_seconds"])
     subprocess.run(["xdotool", "key", "--clearmodifiers", "Return"],
                    timeout=10, check=False)
     return True
 
 
 def restart_grd():
-    """Bounce the daemon so a connected client renegotiates at the new size.
-
-    GRD negotiates its graphics pipeline once, at connect. Resizing the capture
-    surface underneath a live session leaves the encoder sized for the old
-    framebuffer: video freezes while input keeps working. Reconnecting is the
-    only way to resync, so we force it rather than leave a wedged session.
-    """
     subprocess.run(["systemctl", "--user", "restart", "gnome-remote-desktop"],
                    timeout=30, check=False)
 
 
 def watch():
     bus = connect_bus()
-    ensure_connector(bus)
+    resolve_connector(bus)
+
+    remote = config["remote_profile"]
+    local = config["local_profile"]
+    poll = config["poll_seconds"]
+    window = config["assert_window_seconds"]
+    budget = config["max_asserts"]
+
     pending = None
     ticks = 0
     grace_until = 0.0
     applies = []
     last_want = None
 
-    log("watching: %s when connected, %s when idle" % (REMOTE_PROFILE, LOCAL_PROFILE))
+    log("watching %s: %s when connected, %s when idle"
+        % (connector, remote, local))
 
     while True:
-        time.sleep(POLL_SECONDS)
+        time.sleep(poll)
         now = time.monotonic()
 
-        count = rdp_sessions()
-        if count is None:
+        sessions = rdp_sessions()
+        if sessions is None:
             continue
-        if count == 0 and now < grace_until:
+        if sessions == 0 and now < grace_until:
             continue
 
-        want = REMOTE_PROFILE if count > 0 else LOCAL_PROFILE
+        want = remote if sessions > 0 else local
 
         try:
             live = current_profile(bus)
         except Exception as exc:
-            log("read failed: %s" % exc)
+            log("could not read display state: %s" % exc)
             try:
                 bus = connect_bus()
             except Exception:
                 pass
             continue
 
-        # A change in what we want is a fresh situation: forget any past
-        # failures and start trying again.
         if want != last_want:
             last_want, applies = want, []
 
-        # Deliberately does not clear `applies`: the config reads back correct
-        # during the OSD countdown, and clearing here is what let it loop.
         if live == want:
             pending, ticks = None, 0
             continue
 
-        applies = [t for t in applies if now - t < ASSERT_WINDOW_SECONDS]
-        if len(applies) >= MAX_ASSERTS:
+        applies = [stamp for stamp in applies if now - stamp < window]
+        if len(applies) >= budget:
             continue
 
-        needed = CONNECT_TICKS if want == REMOTE_PROFILE else DISCONNECT_TICKS
+        needed = config["connect_ticks"] if want == remote else config["disconnect_ticks"]
         if want == pending:
             ticks += 1
         else:
@@ -280,68 +281,98 @@ def watch():
 
         try:
             changed = apply_profile(bus, want)
-            applies.append(time.monotonic())
-            log("%d session(s), %s -> %s" % (count, live, want))
+            log("%d session(s), %s -> %s" % (sessions, live, want))
             if changed:
+                applies.append(time.monotonic())
                 confirm_display_change()
-            if len(applies) >= MAX_ASSERTS:
-                log("%s keeps getting reverted; giving up for %d min"
-                    % (want, ASSERT_WINDOW_SECONDS // 60))
-            # Only bounce when we actually resized under a live client. If the
-            # profile was already correct there is nothing to resync, and
-            # bouncing anyway would drop a healthy session on every connect.
-            if BOUNCE_AFTER_RESIZE and changed and want == REMOTE_PROFILE and count > 0:
-                restart_grd()
-                grace_until = time.monotonic() + RECONNECT_GRACE_SECONDS
-                log("bounced daemon; client should reconnect")
+                if len(applies) >= budget:
+                    log("%s keeps reverting; giving up for %d minutes"
+                        % (want, window // 60))
+                if config["bounce_after_resize"] and want == remote and sessions > 0:
+                    restart_grd()
+                    grace_until = time.monotonic() + config["reconnect_grace_seconds"]
+                    log("restarted gnome-remote-desktop; client should reconnect")
             pending, ticks = None, 0
         except Exception as exc:
-            log("apply %s failed: %s" % (want, exc))
+            log("could not apply %s: %s" % (want, exc))
             try:
                 bus = connect_bus()
             except Exception:
                 pass
-            ticks = needed - 1
+            ticks = max(0, needed - 1)
+
+
+def show_config():
+    print("source    : %s" % config_source)
+    print("connector : %s" % (config["connector"] or "(auto)"))
+    print("remote    : %s" % config["remote_profile"])
+    print("local     : %s" % config["local_profile"])
+    print("profiles  :")
+    for name, profile in sorted(config["profiles"].items()):
+        print("   %-14s %-22s scale %s"
+              % (name, profile["mode"], profile["scale"]))
+
+
+def show_status(bus):
+    resolve_connector(bus)
+    _serial, mode, scale = read_current(bus)
+    sessions = rdp_sessions()
+    print("connector : %s" % connector)
+    print("mode      : %s" % mode)
+    print("scale     : %s" % scale)
+    print("profile   : %s" % (current_profile(bus) or "(unrecognised)"))
+    print("sessions  : %s" % ("unknown" if sessions is None else sessions))
+
+
+def usage(code):
+    print(__doc__)
+    if config["profiles"]:
+        print("profiles: %s" % ", ".join(sorted(config["profiles"])))
+    return code
 
 
 def main():
     args = sys.argv[1:]
     if not args:
-        print(__doc__)
-        return 1
+        return usage(1)
 
-    if args[0] == "watch":
-        watch()
-        return 0
+    command = args[0]
 
-    if args[0] == "modes":
+    if command == "modes":
         list_modes(connect_bus())
         return 0
 
-    if args[0] == "status":
-        bus = connect_bus()
-        ensure_connector(bus)
-        _serial, mode, scale = read_current(bus)
-        count = rdp_sessions()
-        print("connector : %s" % CONNECTOR)
-        print("mode      : %s" % mode)
-        print("scale     : %s" % scale)
-        print("profile   : %s" % (current_profile(bus) or "(custom)"))
-        print("sessions  : %s" % ("unknown" if count is None else count))
+    load_config()
+
+    if command == "watch":
+        watch()
         return 0
 
-    if args[0] == "apply" and len(args) > 1 and args[1] in PROFILES:
+    if command == "config":
+        show_config()
+        return 0
+
+    if command == "status":
+        show_status(connect_bus())
+        return 0
+
+    if command == "apply":
+        if len(args) < 2:
+            return usage(1)
+        name = args[1]
+        if name not in config["profiles"]:
+            fail("no profile %r in %s (have: %s)"
+                 % (name, config_source, ", ".join(sorted(config["profiles"]))))
         bus = connect_bus()
-        ensure_connector(bus)
-        changed = apply_profile(bus, args[1])
-        if changed:
+        resolve_connector(bus)
+        if apply_profile(bus, name):
             confirm_display_change()
-        print("applied %s" % args[1] if changed else "already on %s" % args[1])
+            print("applied %s" % name)
+        else:
+            print("already on %s" % name)
         return 0
 
-    print(__doc__)
-    print("profiles: %s" % ", ".join(PROFILES))
-    return 1
+    return usage(1)
 
 
 if __name__ == "__main__":
