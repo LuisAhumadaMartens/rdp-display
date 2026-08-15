@@ -1,0 +1,13 @@
+[Unit]
+Description=Force display profile to match remote desktop session state
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rdp-display watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
