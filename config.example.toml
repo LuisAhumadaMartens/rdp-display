@@ -1,0 +1,30 @@
+connector = ""
+
+remote_profile = "remote"
+local_profile = "local"
+
+bounce_after_resize = false
+
+poll_seconds = 0.5
+connect_ticks = 2
+disconnect_ticks = 30
+confirm_delay_seconds = 2.0
+reconnect_grace_seconds = 60
+max_asserts = 3
+assert_window_seconds = 900
+
+[profiles.local]
+mode = "3840x2160@60.000"
+scale = 1.5
+
+[profiles.remote]
+mode = "2560x1440@60.000"
+scale = 2.0
+
+[profiles.remote-wide]
+mode = "2560x1440@60.000"
+scale = 1.0
+
+[profiles.remote-small]
+mode = "1920x1080@60.000"
+scale = 1.0
