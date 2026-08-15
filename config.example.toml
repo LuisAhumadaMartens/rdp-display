@@ -1,6 +1,6 @@
 connector = ""
 
-remote_profile = "remote-hidpi"
+remote_profile = "remote"
 local_profile = "local"
 
 bounce_after_resize = false
@@ -14,17 +14,17 @@ max_asserts = 3
 assert_window_seconds = 900
 
 [profiles.local]
-mode = "3840x2160@119.999"
+mode = "3840x2160@60.000"
 scale = 1.5
 
 [profiles.remote]
-mode = "1920x1080@119.879"
-scale = 1.0
-
-[profiles.remote-1440]
-mode = "2560x1440@120.000"
-scale = 1.0
-
-[profiles.remote-hidpi]
-mode = "2560x1440@120.000"
+mode = "2560x1440@60.000"
 scale = 2.0
+
+[profiles.remote-wide]
+mode = "2560x1440@60.000"
+scale = 1.0
+
+[profiles.remote-small]
+mode = "1920x1080@60.000"
+scale = 1.0

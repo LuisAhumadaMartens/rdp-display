@@ -4,8 +4,8 @@ Switches your desktop resolution when you connect over GNOME Remote Desktop, and
 switches it back when you disconnect.
 
 ```
-connected  ->  2560x1440 @120Hz, scale 200%
-idle       ->  3840x2160 @120Hz, scale 150%
+connected  ->  a resolution and scale that suit the machine you connect from
+idle       ->  whatever your monitor normally runs
 ```
 
 ## Why
@@ -95,25 +95,26 @@ rdp-display modes
 ```
 
 ```
-DP-0  (AUS PG32UCDM)
-   3840x2160@119.999   scales=[1.0, 1.25, 1.5, 2.0, ...] is-preferred
-   2560x1440@120.000   scales=[1.0, 1.25, 1.495, 2.0, ...]
+DP-1  (<vendor> <model>)
+   3840x2160@60.000    scales=[1.0, 1.25, 1.5, 2.0, ...] is-preferred
+   2560x1440@60.000    scales=[1.0, 1.25, 1.5, 2.0, ...]
 ```
 
-Then write them in:
+Then write them in. Mode IDs must be copied exactly from your own output — the
+values below are only an example:
 
 ```toml
 connector = ""
 
-remote_profile = "remote-hidpi"
+remote_profile = "remote"
 local_profile = "local"
 
 [profiles.local]
-mode = "3840x2160@119.999"
+mode = "3840x2160@60.000"
 scale = 1.5
 
-[profiles.remote-hidpi]
-mode = "2560x1440@120.000"
+[profiles.remote]
+mode = "2560x1440@60.000"
 scale = 2.0
 ```
 
@@ -131,9 +132,11 @@ rdp-display config
 What matters is how far your client has to shrink the image. Match the session
 width to your client window's width and both problems go away together.
 
-The example config ships four. `remote-hidpi` streams a 1280x720 logical desktop
-at 1440p: large and sharp, less room to work. `remote-1440` gives the most room.
-`remote` is 1080p, between the two.
+Scale is the second lever. A mode at scale 1.0 gives you its full resolution as
+working space. The same mode at scale 2.0 gives you a quarter of the pixels as
+working space, drawn twice as large — sharp and easy to read on a high-density
+laptop screen, with less room to work in. Try a few; the example config includes
+several to compare.
 
 ### Settings
 
@@ -189,7 +192,7 @@ If your remote and local profiles would be the same, you don't need the service:
 
 ```sh
 systemctl --user disable --now rdp-display
-rdp-display apply remote-hidpi
+rdp-display apply remote
 ```
 
 `ApplyMonitorsConfig` writes persistently, so that survives reboots on its own.
